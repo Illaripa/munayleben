@@ -28,23 +28,41 @@ Wenn du die vollständige Strategie lieferst und der Redaktionskalender bereit i
 
 WICHTIG: Sprich immer auf Deutsch. Sei direkt, strategisch und nutze Digital-Marketing-Fachbegriffe. Keine leeren Floskeln.`;
 
+  // ── Streaming SSE response ──────────────────────────────────
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  let fullText = "";
+
   try {
     const stream = client.messages.stream({
-      model: "claude-opus-4-6",
+      model: "claude-sonnet-4-5",
       max_tokens: 2048,
       system: systemPrompt,
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
     });
 
-    const response = await stream.finalMessage();
-    const text =
-      response.content[0]?.type === "text" ? response.content[0].text : "";
-    const calBtn = text.includes("[CALENDAR_READY]");
-    const cleanText = text.replace("[CALENDAR_READY]", "").trim();
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta?.type === "text_delta"
+      ) {
+        const delta = chunk.delta.text;
+        fullText += delta;
+        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      }
+    }
 
-    res.json({ text: cleanText, calBtn });
+    const calBtn = fullText.includes("[CALENDAR_READY]");
+    const cleanText = fullText.replace("[CALENDAR_READY]", "").trim();
+
+    res.write(`data: ${JSON.stringify({ done: true, text: cleanText, calBtn })}\n\n`);
   } catch (error) {
     console.error("Manager API error:", error);
-    res.status(500).json({ error: "API error", details: error.message });
+    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+  } finally {
+    res.end();
   }
 }

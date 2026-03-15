@@ -78,30 +78,50 @@ Gib NUR die Hashtags aus, mit # vor jedem, durch Leerzeichen getrennt, keine Kom
 ===BILD===
 [2-3 Sätze: Welches Foto oder Visual passt? Farben, Stimmung, Motiv — konkret und umsetzbar für Canva oder eigenes Foto]`;
 
+  // ── Streaming SSE response ──────────────────────────────────
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  let fullText = "";
+
   try {
     const stream = client.messages.stream({
-      model: "claude-opus-4-6",
-      max_tokens: 4096,
+      model: "claude-sonnet-4-5",
+      max_tokens: 2500,
       system: systemPrompt,
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
     });
 
-    const response = await stream.finalMessage();
-    const text =
-      response.content[0]?.type === "text" ? response.content[0].text : "";
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta?.type === "text_delta"
+      ) {
+        const delta = chunk.delta.text;
+        fullText += delta;
+        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      }
+    }
 
-    // Parse sections
-    const contentMatch = text.match(/===CONTENT===([\s\S]*?)(?:===HASHTAGS===|$)/);
-    const hashtagsMatch = text.match(/===HASHTAGS===([\s\S]*?)(?:===BILD===|$)/);
-    const bildMatch = text.match(/===BILD===([\s\S]*?)$/);
+    // Parse and send final structured result
+    const contentMatch = fullText.match(/===CONTENT===([\s\S]*?)(?:===HASHTAGS===|$)/);
+    const hashtagsMatch = fullText.match(/===HASHTAGS===([\s\S]*?)(?:===BILD===|$)/);
+    const bildMatch = fullText.match(/===BILD===([\s\S]*?)$/);
 
-    res.json({
-      text: contentMatch ? contentMatch[1].trim() : text,
-      hashtags: hashtagsMatch ? hashtagsMatch[1].trim() : "",
-      bild: bildMatch ? bildMatch[1].trim() : "",
-    });
+    res.write(
+      `data: ${JSON.stringify({
+        done: true,
+        text: contentMatch ? contentMatch[1].trim() : fullText,
+        hashtags: hashtagsMatch ? hashtagsMatch[1].trim() : "",
+        bild: bildMatch ? bildMatch[1].trim() : "",
+      })}\n\n`
+    );
   } catch (error) {
     console.error("Assistent API error:", error);
-    res.status(500).json({ error: "API error", details: error.message });
+    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+  } finally {
+    res.end();
   }
 }

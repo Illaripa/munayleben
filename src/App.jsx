@@ -90,6 +90,11 @@ const SERIF = "'Cormorant Garamond', Georgia, serif";
 const CAPS  = "'Cinzel', Georgia, serif";
 const SANS  = "'DM Sans', system-ui, sans-serif";
 
+// Base font sizes — increase these to make everything bigger
+const FS_BODY  = 16;   // main body text (was 14)
+const FS_SMALL = 14;   // secondary text (was 12-13)
+const FS_TINY  = 12;   // labels/badges (was 11)
+
 const FMT = { Post: "📝", Reel: "🎬", Karussell: "🎠", Story: "📲" };
 const MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
 const DAYS = ["Mo","Di","Mi","Do","Fr","Sa","So"];
@@ -130,27 +135,53 @@ function generateCalendar(year, month) {
   return cal;
 }
 
-/* ── API CALLS ──────────────────────────────────────────────── */
-const MAX_TEXTOS = 40000; // ~40KB max per request to avoid Vercel 4.5MB limit
+/* ── API CALLS (SSE streaming) ──────────────────────────────── */
+const MAX_TEXTOS = 40000;
 
-async function callManager(msgs, textos) {
+// Parse SSE stream and call onDelta(text) for each chunk, returns final parsed result
+async function readSSE(response, onDelta) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop(); // keep incomplete line
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const payload = JSON.parse(line.slice(6));
+        if (payload.error) throw new Error(payload.error);
+        if (payload.delta && onDelta) onDelta(payload.delta);
+        if (payload.done) result = payload;
+      } catch (e) { /* skip malformed */ }
+    }
+  }
+  return result;
+}
+
+async function callManager(msgs, textos, onDelta) {
   const res = await fetch("/api/manager", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages: msgs, textos: textos ? textos.slice(0, MAX_TEXTOS) : "" }),
   });
   if (!res.ok) throw new Error(`API ${res.status}`);
-  return res.json();
+  return readSSE(res, onDelta);
 }
 
-async function callAssistent(msgs, task, textos) {
+async function callAssistent(msgs, task, textos, onDelta) {
   const res = await fetch("/api/assistent", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages: msgs, task, textos: textos ? textos.slice(0, MAX_TEXTOS) : "" }),
   });
   if (!res.ok) throw new Error(`API ${res.status}`);
-  return res.json(); // returns { text, hashtags, bild }
+  return readSSE(res, onDelta); // returns { text, hashtags, bild }
 }
 
 /* ── FORMAT COLORS ──────────────────────────────────────────── */
@@ -264,7 +295,7 @@ function MetrikenUpload({ onAnalyze }) {
       <input ref={ref} type="file" accept=".csv,.txt,.tsv" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
       <div style={{ fontSize: 36, marginBottom: 10 }}>📂</div>
       {fileName
-        ? <p style={{ color: "#6A3A8A", fontWeight: 600, fontSize: 14, margin: 0 }}>✅ {fileName} — wird analysiert…</p>
+        ? <p style={{ color: "#6A3A8A", fontWeight: 600, fontSize: FS_BODY, margin: 0 }}>✅ {fileName} — wird analysiert…</p>
         : <>
             <p style={{ color: DARK, fontWeight: 600, fontSize: 15, margin: "0 0 6px" }}>CSV hier ablegen oder klicken</p>
             <p style={{ color: MUTED, fontSize: 13, margin: 0 }}>Unterstützt: .csv, .txt, .tsv (Instagram Export)</p>
@@ -281,7 +312,7 @@ function ManualMetriken({ onAnalyze }) {
     <div style={{ marginBottom: 12 }}>
       <label style={{ display: "block", fontSize: 12, color: MUTED, fontWeight: 600, letterSpacing: "0.08em", marginBottom: 4, textTransform: "uppercase" }}>{label}</label>
       <input value={vals[key]} onChange={e => set(key, e.target.value)} placeholder={placeholder}
-        style={{ width: "100%", border: `1.5px solid ${BORDER}`, borderRadius: 8, padding: "9px 12px", fontSize: 14, color: DARK, fontFamily: SANS, outline: "none", boxSizing: "border-box", background: "#FAFAFA" }} />
+        style={{ width: "100%", border: `1.5px solid ${BORDER}`, borderRadius: 8, padding: "9px 12px", fontSize: FS_BODY, color: DARK, fontFamily: SANS, outline: "none", boxSizing: "border-box", background: "#FAFAFA" }} />
     </div>
   );
   function submit() {
@@ -481,9 +512,16 @@ export default function App() {
   async function sendManagerMsg(text) {
     if (!text.trim() || loading) return;
     const newMsgs = [...managerMsgs, { role: "user", content: text }];
-    setManagerMsgs(newMsgs); setInput(""); setLoading(true);
+    const placeholder = [...newMsgs, { role: "assistant", content: "", streaming: true }];
+    setManagerMsgs(placeholder); setInput(""); setLoading(true);
     try {
-      const result = await callManager(newMsgs, textos);
+      const result = await callManager(newMsgs, textos, (delta) => {
+        setManagerMsgs(prev => {
+          const msgs = [...prev];
+          msgs[msgs.length - 1] = { role: "assistant", content: msgs[msgs.length - 1].content + delta, streaming: true };
+          return msgs;
+        });
+      });
       setManagerMsgs([...newMsgs, { role: "assistant", content: result.text }]);
       if (result.calBtn) setShowCalBtn(true);
     } catch {
@@ -495,10 +533,17 @@ export default function App() {
   async function sendAssistentMsg(text) {
     if (!text.trim() || loading) return;
     const newMsgs = [...assistentMsgs, { role: "user", content: text }];
-    setAssistentMsgs(newMsgs); setInput(""); setLoading(true);
+    const placeholder = [...newMsgs, { role: "assistant", content: "", streaming: true }];
+    setAssistentMsgs(placeholder); setInput(""); setLoading(true);
     try {
-      const reply = await callAssistent(newMsgs, calendarTask, textos);
-      setAssistentMsgs([...newMsgs, { role: "assistant", content: reply.text || reply }]);
+      const reply = await callAssistent(newMsgs, calendarTask, textos, (delta) => {
+        setAssistentMsgs(prev => {
+          const msgs = [...prev];
+          msgs[msgs.length - 1] = { role: "assistant", content: msgs[msgs.length - 1].content + delta, streaming: true };
+          return msgs;
+        });
+      });
+      setAssistentMsgs([...newMsgs, { role: "assistant", content: reply.text || "" }]);
     } catch {
       setAssistentMsgs([...newMsgs, { role: "assistant", content: "Verbindungsfehler — bitte erneut versuchen." }]);
     }
@@ -550,11 +595,22 @@ export default function App() {
     if (!task || task.estado === "listo") return;
     setGeneratingDay(dateKey);
     setCalendar(prev => ({ ...prev, [dateKey]: { ...prev[dateKey], estado: "generando" } }));
+    // Stream content directly into the modal textarea
+    setEditContent(""); setEditHashtags(""); setEditBild("");
+    let streamed = "";
     try {
       const msgs = [{ role: "user", content: `Erstelle ${task.formato} über "${task.tema}" für die Säule "${task.pilar}". CTA: ${task.cta}.` }];
-      const result = await callAssistent(msgs, task, textos);
+      const result = await callAssistent(msgs, task, textos, (delta) => {
+        streamed += delta;
+        // Show content portion live (everything before ===HASHTAGS===)
+        const contentPart = streamed.split("===HASHTAGS===")[0].replace("===CONTENT===", "").trim();
+        setEditContent(contentPart);
+      });
+      setEditContent(result.text || "");
+      setEditHashtags(result.hashtags || "");
+      setEditBild(result.bild || "");
       setCalendar(prev => {
-        const updated = { ...prev, [dateKey]: { ...prev[dateKey], estado: "listo", contenido: result.text || result, hashtags: result.hashtags || "", bild: result.bild || "" } };
+        const updated = { ...prev, [dateKey]: { ...prev[dateKey], estado: "listo", contenido: result.text || "", hashtags: result.hashtags || "", bild: result.bild || "" } };
         const s = JSON.stringify(updated);
         localStorage.setItem("munay_calendar", s);
         dbSet("calendar", s);
@@ -584,9 +640,9 @@ export default function App() {
       try {
         const task = calendar[dk];
         const msgs = [{ role: "user", content: `Erstelle ${task.formato} über "${task.tema}" für die Säule "${task.pilar}". CTA: ${task.cta}.` }];
-        const result = await callAssistent(msgs, task, textos);
+        const result = await callAssistent(msgs, task, textos, null);
         setCalendar(prev => {
-          const updated = { ...prev, [dk]: { ...prev[dk], estado: "listo", contenido: result.text || result, hashtags: result.hashtags || "", bild: result.bild || "" } };
+          const updated = { ...prev, [dk]: { ...prev[dk], estado: "listo", contenido: result.text || "", hashtags: result.hashtags || "", bild: result.bild || "" } };
           const s = JSON.stringify(updated);
           localStorage.setItem("munay_calendar", s);
           dbSet("calendar", s);
@@ -625,7 +681,7 @@ export default function App() {
         {/* Info card */}
         <div style={{ background: "#fff", border: `1px solid ${BORDER}`, borderLeft: `4px solid ${GOLD}`, borderRadius: 12, padding: "20px 24px", marginBottom: 24 }}>
           <h2 style={{ margin: "0 0 8px", fontSize: 20, color: BLACK, fontFamily: SERIF, fontWeight: 600 }}>Deine Wissensbasis</h2>
-          <p style={{ margin: 0, fontSize: 14, color: MED, lineHeight: 1.7 }}>
+          <p style={{ margin: 0, fontSize: FS_BODY, color: MED, lineHeight: 1.7 }}>
             Lade deine .txt Texte hoch — Manager und Assistent übernehmen dann deinen Schreibstil und dein Vokabular.
             Du kannst jederzeit neue Texte hinzufügen oder bestehende ersetzen.
           </p>
@@ -707,7 +763,7 @@ export default function App() {
           <div style={{ background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 12, padding: "16px 20px", marginBottom: 20 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
               <div style={{ flex: 1, minWidth: 200 }}>
-                <div style={{ fontSize: 13, color: MED, marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
+                <div style={{ fontSize: FS_SMALL, color: MED, marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
                   <span>
                     <strong style={{ color: DARK, fontSize: 15 }}>{listo}</strong>
                     <span style={{ color: MUTED }}> / {monthKeys.length} Content-Stücke erstellt</span>
@@ -861,7 +917,7 @@ export default function App() {
                       <textarea
                         value={editContent}
                         onChange={e => setEditContent(e.target.value)}
-                        style={{ width: "100%", minHeight: 200, padding: "14px", background: "#FAFAF8", border: `1.5px solid ${BORDER}`, borderRadius: 12, fontSize: 14, lineHeight: 1.8, color: DARK, fontFamily: SANS, resize: "vertical", outline: "none", boxSizing: "border-box" }}
+                        style={{ width: "100%", minHeight: 200, padding: "14px", background: "#FAFAF8", border: `1.5px solid ${BORDER}`, borderRadius: 12, fontSize: FS_BODY, lineHeight: 1.8, color: DARK, fontFamily: SANS, resize: "vertical", outline: "none", boxSizing: "border-box" }}
                         onFocus={e => e.target.style.borderColor = GOLD}
                         onBlur={e => e.target.style.borderColor = BORDER}
                       />
@@ -1055,7 +1111,7 @@ export default function App() {
                 <div style={{ fontSize: 28, marginBottom: 14 }}>{c.icon}</div>
                 <div style={{ fontSize: 10, letterSpacing: "0.18em", color: c.accent, fontFamily: CAPS, fontWeight: 700, marginBottom: 8 }}>{c.label}</div>
                 <h2 style={{ fontSize: 18, fontWeight: 700, color: BLACK, fontFamily: SERIF, margin: "0 0 10px", lineHeight: 1.2 }}>{c.title}</h2>
-                <p style={{ fontSize: 13, color: MED, lineHeight: 1.7, margin: "0 0 14px" }}>{c.desc}</p>
+                <p style={{ fontSize: FS_SMALL, color: MED, lineHeight: 1.7, margin: "0 0 14px" }}>{c.desc}</p>
                 {c.badge && <Badge color={c.badgeColor}>{c.badge}</Badge>}
                 {!c.badge && c.empty && <span style={{ fontSize: 12, color: "#C0B8A8", fontStyle: "italic" }}>{c.empty}</span>}
               </button>
@@ -1095,14 +1151,14 @@ export default function App() {
       } else if (/^---+$/.test(line.trim())) {
         elements.push(<hr key={i} style={{ border: "none", borderTop: `1px solid ${BORDER}`, margin: "14px 0" }} />);
       } else if (/^[\*\-]\s/.test(line)) {
-        elements.push(<div key={i} style={{ display: "flex", gap: 8, marginBottom: 4 }}><span style={{ color: GOLD, flexShrink: 0, marginTop: 2 }}>•</span><span style={{ color: DARK, fontSize: 14, lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: line.replace(/^[\*\-]\s/, "").replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} /></div>);
+        elements.push(<div key={i} style={{ display: "flex", gap: 8, marginBottom: 4 }}><span style={{ color: GOLD, flexShrink: 0, marginTop: 2 }}>•</span><span style={{ color: DARK, fontSize: FS_BODY, lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: line.replace(/^[\*\-]\s/, "").replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} /></div>);
       } else if (/^\d+\.\s/.test(line)) {
         const num = line.match(/^(\d+)\./)[1];
-        elements.push(<div key={i} style={{ display: "flex", gap: 8, marginBottom: 4 }}><span style={{ color: GOLD, fontWeight: 700, flexShrink: 0, minWidth: 20, fontSize: 13 }}>{num}.</span><span style={{ color: DARK, fontSize: 14, lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: line.replace(/^\d+\.\s/, "").replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} /></div>);
+        elements.push(<div key={i} style={{ display: "flex", gap: 8, marginBottom: 4 }}><span style={{ color: GOLD, fontWeight: 700, flexShrink: 0, minWidth: 20, fontSize: 13 }}>{num}.</span><span style={{ color: DARK, fontSize: FS_BODY, lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: line.replace(/^\d+\.\s/, "").replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} /></div>);
       } else if (line.trim() === "") {
         elements.push(<div key={i} style={{ height: 6 }} />);
       } else {
-        elements.push(<p key={i} style={{ color: DARK, fontSize: 14, lineHeight: 1.8, margin: "0 0 4px" }} dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>') }} />);
+        elements.push(<p key={i} style={{ color: DARK, fontSize: FS_BODY, lineHeight: 1.8, margin: "0 0 4px" }} dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>') }} />);
       }
       i++;
     }
@@ -1122,7 +1178,7 @@ export default function App() {
           <div style={{ background: "#F8F4FF", border: "1.5px solid #D4B8F0", borderRadius: 14, padding: "20px 24px", marginBottom: 24 }}>
             <div style={{ fontSize: 24, marginBottom: 8 }}>📊</div>
             <h3 style={{ color: BLACK, fontFamily: SERIF, fontSize: 17, marginBottom: 8 }}>Instagram Statistiken hochladen</h3>
-            <p style={{ color: MED, fontSize: 14, lineHeight: 1.7, margin: "0 0 12px" }}>
+            <p style={{ color: MED, fontSize: FS_BODY, lineHeight: 1.7, margin: "0 0 12px" }}>
               Exportiere deine Instagram-Statistiken als CSV (Instagram → Statistiken → Exportieren) und lade die Datei hier hoch. Der Marketing Manager analysiert dann, was funktioniert.
             </p>
             <div style={{ background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 16px" }}>
@@ -1222,7 +1278,7 @@ export default function App() {
               <h2 style={{ color: BLACK, fontSize: 20, marginBottom: 10, fontFamily: SERIF, fontWeight: 700, lineHeight: 1.3 }}>
                 {isManager ? "Marketing Manager — dein strategischer Berater" : "Marketing Assistent — deine kreative Hand"}
               </h2>
-              <p style={{ color: MED, fontSize: 14, lineHeight: 1.8, margin: 0 }}>
+              <p style={{ color: MED, fontSize: FS_BODY, lineHeight: 1.8, margin: 0 }}>
                 {isManager
                   ? "Ich stelle dir die richtigen Fragen, analysiere deine Situation und erstelle einen personalisierten Redaktionskalender. Erzähl mir deine Ziele."
                   : calendarTask
@@ -1286,10 +1342,22 @@ export default function App() {
                   boxShadow: isAssistant ? "0 2px 12px rgba(0,0,0,0.06)" : "none",
                   wordBreak: "break-word",
                 }}>
-                  {isAssistant ? renderMD(msg.content) : (
-                    <p style={{ color: DARK, fontSize: 14, lineHeight: 1.8, margin: 0 }}>{msg.content}</p>
+                  {isAssistant ? (
+                    <>
+                      {renderMD(msg.content)}
+                      {msg.streaming && (
+                        <span style={{
+                          display: "inline-block", width: 8, height: 16,
+                          background: accentColor, borderRadius: 2, marginLeft: 2,
+                          animation: "blink 0.8s step-end infinite",
+                          verticalAlign: "middle",
+                        }} />
+                      )}
+                    </>
+                  ) : (
+                    <p style={{ color: DARK, fontSize: FS_BODY, lineHeight: 1.8, margin: 0 }}>{msg.content}</p>
                   )}
-                  {isAssistant && (
+                  {isAssistant && !msg.streaming && (
                     <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${BORDER}`, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                       <Btn variant="ghost" small onClick={() => navigator.clipboard.writeText(msg.content).then(() => alert("Kopiert! 🌿"))}>📋 Kopieren</Btn>
                       {isManager && !showCalBtn && msgs.length >= 4 && (
