@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "api/assistent.js": { "maxDuration": 60 },
+    "api/manager.js": { "maxDuration": 60 }
+  }
+}
